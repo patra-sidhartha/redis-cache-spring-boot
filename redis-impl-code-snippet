@@ -178,3 +178,208 @@ Key Differences from Annotations
     - Complexity: You must handle potential null checks, serialization errors, and cache key naming manually.
     - Data Structures: While annotations mostly use simple Key-Value pairs, RedisTemplate gives you direct access to advanced Redis types like Hashes, Lists, Sets, and Sorted Sets (using opsForHash(), opsForList(), etc.). 
 
+
+End-to-End Impl
+---------------- 
+1. Project Dependencies
+pom.xml
+========= 
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-cache</artifactId>
+        </dependency>
+        <!-- Your DB driver, e.g., H2 or MySQL -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+    </dependencies>
+2. Configuration
+    application.properties
+
+        spring.data.redis.host=localhost
+        spring.data.redis.port=6379
+        spring.cache.type=redis
+        # Set default TTL (e.g., 10 minutes)
+        spring.cache.redis.time-to-live=10m
+3. Enable Caching
+    @SpringBootApplication
+    @EnableCaching
+    public class RedisDemoApplication {
+        public static void main(String[] args) {
+            SpringApplication.run(RedisDemoApplication.class, args);
+        }
+    }
+
+4. Implementation (DAO/Service Layer)
+    @Repository
+    public interface UserRepository extends JpaRepository<User, Long> {}
+
+    Service Layer (with Caching): Use @Cacheable to store results, @CachePut to update, and @CacheEvict to remove entries.
+
+    @Service
+    public class UserService {
+        @Autowired
+        private UserRepository userRepository;
+
+        // Caches the result using 'users' as cache name and user id as key
+        @Cacheable(value = "users", key = "#id")
+        public User getUserById(Long id) {
+            // This method is only executed if the result is not in Redis
+            return userRepository.findById(id).orElseThrow();
+        }
+
+        // Updates the cache whenever a user is updated
+        @CachePut(value = "users", key = "#user.id")
+        public User updateUser(User user) {
+            return userRepository.save(user);
+        }
+
+        // Removes the user from cache when deleted from DB
+        @CacheEvict(value = "users", key = "#id")
+        public void deleteUser(Long id) {
+            userRepository.deleteById(id);
+        }
+    }
+5. Custom Cache Configuration (Optional)
+    @Configuration
+    public class RedisConfig {
+        @Bean
+        public RedisCacheConfiguration cacheConfiguration() {
+            return RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(10))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new GenericJackson2JsonRedisSerializer()));
+        }
+    }
+
+1. Conditional Caching Logic
+    @Service
+    public class UserService {
+        @Autowired
+        private UserRepository userRepository;
+
+        /**
+        * Cache entry ONLY IF:
+        * 1. The ID is greater than 10 (condition)
+        * 2. The returned user is not null (unless)
+        */
+        @Cacheable(
+            value = "users", 
+            key = "#id", 
+            condition = "#id > 10", 
+            unless = "#result == null"
+        )
+        public User getUserById(Long id) {
+            return userRepository.findById(id).orElse(null);
+        }
+
+        /**
+        * Cache update ONLY IF:
+        * The user's role is not 'ADMIN' (we don't want to cache admins for security)
+        */
+        @CachePut(
+            value = "users", 
+            key = "#user.id", 
+            condition = "!#user.role.equals('ADMIN')"
+        )
+        public User updateUser(User user) {
+            return userRepository.save(user);
+        }
+    }
+
+2. Common Condition Patterns
+    In 2026, these SpEL (Spring Expression Language) patterns are the standard for fine-tuning performance:
+    Scenario	SpEL Expression
+    By Argument Size	condition = "#name.length() > 3"
+    By Argument Value	condition = "#status == 'ACTIVE'"
+    By Result Content	unless = "#result.isPrivate == true"
+    Null Safety	unless = "#result == null"
+
+
+With Redis Hash
+================ 
+
+1. The Domain Entity
+
+    import jakarta.persistence.*;
+    import org.springframework.data.redis.core.RedisHash;
+    import org.springframework.data.annotation.Id;
+    import java.io.Serializable;
+
+    @Entity
+    @Table(name = "employees")
+    @RedisHash(value = "Employee", timeToLive = 600) // Defined Redis Hash name and 10min TTL
+    public class Employee implements Serializable {
+
+        @jakarta.persistence.Id // JPA PK
+        @org.springframework.data.annotation.Id // Redis Field Key
+        private String id;
+        
+        private String name;
+        private String department;
+
+        // Standard getters/setters/constructors
+    }
+
+2. Dual-DAO Layer (Repositories)
+    @Repository
+    public interface EmployeeJpaRepository extends JpaRepository<Employee, String> {}
+
+    @Repository
+    public interface EmployeeRedisRepository extends CrudRepository<Employee, String> {}
+
+3. Service Layer (Cache Logic)
+        @Service
+        public class EmployeeService {
+
+            private final EmployeeJpaRepository dbRepo;
+            private final EmployeeRedisRepository redisRepo;
+
+            public EmployeeService(EmployeeJpaRepository db, EmployeeRedisRepository redis) {
+                this.dbRepo = db;
+                this.redisRepo = redis;
+            }
+
+            public Employee findEmployee(String id) {
+                // Step 1: Check Redis Hash
+                return redisRepo.findById(id).orElseGet(() -> {
+                    // Step 2: On miss, query DB
+                    Employee fromDb = dbRepo.findById(id).orElseThrow();
+                    // Step 3: Populate Redis Hash for future hits
+                    redisRepo.save(fromDb);
+                    return fromDb;
+                });
+            }
+
+            public Employee updateEmployee(Employee emp) {
+                // Always update DB first, then sync Redis
+                Employee updated = dbRepo.save(emp);
+                redisRepo.save(updated);
+                return updated;
+            }
+
+            public void deleteEmployee(String id) {
+                dbRepo.deleteById(id);
+                redisRepo.deleteById(id);
+            }
+        }
+4. Application Configuration
+    @SpringBootApplication
+    @EnableCaching
+    @EnableRedisRepositories // Explicitly enables the CrudRepository for Redis
+    public class RedisApp {
+        public static void main(String[] args) {
+            SpringApplication.run(RedisApp.class, args);
+        }
+    }
+
+
+
+
+
