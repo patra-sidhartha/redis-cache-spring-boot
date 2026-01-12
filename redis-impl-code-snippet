@@ -1,0 +1,180 @@
+Spring Boot 3.x
+--------------
+1. Add Dependencies
+Add these to your pom.xml. The starter includes the Lettuce driver by default.
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-cache</artifactId>
+        </dependency>
+    </dependencies>
+
+2. Configuration (application.properties)
+Set your connection details and a default TTL (Time-To-Live) so your memory doesn't explode.
+    spring.data.redis.host=localhost
+    spring.data.redis.port=6379
+    # Enable caching abstraction
+    spring.cache.type=redis
+    # Optional: Set entry expiration (600 seconds)
+    spring.cache.redis.time-to-live=600000
+
+
+3. Enable Caching
+Add the @EnableCaching annotation to your main application class.
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cache.annotation.EnableCaching;
+
+    @SpringBootApplication
+    @EnableCaching
+    public class RedisDemoApplication {
+        public static void main(String[] args) {
+            SpringApplication.run(RedisDemoApplication.class, args);
+        }
+    }
+
+
+4. Implementation in Service
+Use annotations to manage the data. The first time getUserById is called, it hits the DB; subsequent calls hit Redis.
+
+    import org.springframework.cache.annotation.CacheEvict;
+    import org.springframework.cache.annotation.Cacheable;
+    import org.springframework.stereotype.Service;
+
+    @Service
+    public class UserService {
+
+        // "users" is the cache name (prefix in Redis)
+        @Cacheable(value = "users", key = "#id")
+        public User getUserById(Long id) {
+            // This simulates a slow DB call
+            simulateSlowService();
+            return userRepository.findById(id).orElseThrow();
+        }
+
+        @CacheEvict(value = "users", key = "#id")
+        public void deleteUser(Long id) {
+            userRepository.deleteById(id);
+        }
+
+        private void simulateSlowService() {
+            try { Thread.sleep(3000); } catch (InterruptedException e) {}
+        }
+    }
+
+5. Custom JSON Serialization (Optional but Recommended)
+By default, Spring uses binary serialization (hard to read in Redis CLI). Use this config to store data as JSON.
+    @Configuration
+    public class RedisConfig {
+        @Bean
+        public RedisCacheConfiguration cacheConfiguration() {
+            return RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(10))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair
+            .fromSerializer(new GenericJackson2JsonRedisSerializer()));
+        }
+    }   
+
+Quick Test
+    Run Redis via Docker: docker run -p 6379:6379 redis
+    Call your endpoint.
+    Check Redis via CLI: redis-cli keys *
+    You'll see keys prefixed like users::1
+
+size management is handled by Redis itself or by controlling the lifespan of entries.
+1. The "Hard Limit" (Redis Server Level)
+    You set a global memory limit on the Redis server. When this limit is reached, Redis will automatically delete old data to make room for new data based on an eviction policy.
+
+    Configuring via redis.conf:
+    --------------------------- 
+        maxmemory 256mb
+        maxmemory-policy allkeys-lru  # Deletes Least Recently Used keys first
+
+
+    Configuring at runtime via CLI:
+    -------------------------------- 
+        CONFIG SET maxmemory 256mb
+        CONFIG SET maxmemory-policy allkeys-lru
+
+2. Time-Based Size Control (TTL)
+    Since Spring Boot cannot limit the number of keys in Redis, the standard approach is to set a Time-To-Live (TTL). This ensures that entries are eventually removed, preventing the cache from growing indefinitely. 
+
+    You can set a global default or per-cache TTLs in your RedisCacheConfiguration bean:
+        @Bean
+        public RedisCacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+            // Default TTL for all caches
+            RedisCacheConfiguration defaultConfig = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(10));
+
+            // Custom TTL for specific "users" cache
+            Map<String, RedisCacheConfiguration> customConfigs = new HashMap<>();
+            customConfigs.put("users", RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofHours(1)));
+
+            return RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(defaultConfig)
+                .withInitialCacheConfigurations(customConfigs)
+                .build();
+        }
+
+3. Eviction Policies (The "Which to Delete" Rule)
+When your maxmemory is hit, you choose a strategy for what to kick out: 
+   - allkeys-lru: (Recommended) Removes the least recently used keys regardless of whether they have a TTL.
+   - volatile-lru: Only removes keys that have an expiration (TTL) set.
+   - allkeys-lfu: Removes the least frequently used keys.
+   - noeviction: Returns an error when memory is full (risky for production). 
+
+
+In Spring Boot, before (or as an alternative to) using caching annotations like @Cacheable, developers used RedisTemplate to manage cache logic manually. This programmatic approach requires you to write the "check-then-act" logic yourself. 
+
+Manual Caching Logic Flow
+Without annotations, your service method follows these manual steps:
+    - Check: Manually query Redis to see if the data exists.
+    - Hit: If found, return the data immediately (often requires manual casting/serialization).
+    - Miss: If not found, query the primary database, then manually save that result into Redis for next time. 
+
+Example Code with RedisTemplate
+    Here is how you would implement a service using RedisTemplate in a modern Spring Boot 3.x project (2026):
+
+    @Service
+    public class ProductService {
+
+        @Autowired
+        private RedisTemplate<String, Object> redisTemplate;
+
+        @Autowired
+        private ProductRepository productRepository;
+
+        public Product getProduct(Long id) {
+            String key = "PRODUCT_" + id;
+
+            // 1. Manually check the cache
+            Product cachedProduct = (Product) redisTemplate.opsForValue().get(key);
+
+            if (cachedProduct != null) {
+                System.out.println("Cache Hit!");
+                return cachedProduct;
+            }
+
+            // 2. Cache Miss - fetch from DB
+            System.out.println("Cache Miss! Fetching from DB...");
+            Product product = productRepository.findById(id).orElseThrow();
+
+            // 3. Manually store in Redis with a TTL (e.g., 10 minutes)
+            redisTemplate.opsForValue().set(key, product, Duration.ofMinutes(10));
+
+            return product;
+        }
+    }
+
+Key Differences from Annotations
+    - Granular Control: You can decide exactly when to cache data and set different expiration times (TTL) for every single entry, which is harder to do with static annotations.
+    - No Proxy Issues: Annotations rely on Spring AOP proxies and sometimes fail if you call a @Cacheable method from within the same class. Manual code always works regardless of where it is called.
+    - Complexity: You must handle potential null checks, serialization errors, and cache key naming manually.
+    - Data Structures: While annotations mostly use simple Key-Value pairs, RedisTemplate gives you direct access to advanced Redis types like Hashes, Lists, Sets, and Sorted Sets (using opsForHash(), opsForList(), etc.). 
+
